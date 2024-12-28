@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/IERC20.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/utils/SafeERC20.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+
+contract Option is ERC721Enumerable {
+
+    using SafeERC20 for IERC20;
+
+    uint64 private starting_id_index_position = 1;
+    uint64 private starting_id_index_option = 1;
+
+    address public feeRecipient;
+    // TO DO: Add safe address to collect the fees from the contract.
+
+    uint256 public totalPlatformFeesCollected = 0;
+
+    // Events
+    event PositionCreated(uint64 indexed positionId, address indexed provider, uint256 collateralBalance);
+    event OptionBought(uint64 indexed optionId, uint64 indexed positionId, uint256 collateralAmount, uint256 premium);
+    event OptionExpired(uint64 indexed optionId, uint64 indexed positionId, uint256 collateralReturned);
+
+    constructor(address _feeRecipient) ERC721("OptionNFT", "ONFT") {
+        require(_feeRecipient != address(0), "Invalid fee recipient");
+        feeRecipient = _feeRecipient;
+    }
+
+    function mintNFT(address to, uint64 optionId) internal {
+        _safeMint(to, optionId);
+    }
+
+    struct PositionObj{
+        address provider;
+        address collateral_token_address;
+        address accepted_token_address;
+        uint256 collateral_balance;
+        uint16 premium_percentage_one_ten_thousandth;
+        uint16 offered_contract_length;
+        uint64 position_index;
+    }
+
+    struct OptionObj{
+        uint64 position_id_fk;
+        uint256 nft_key;  // Holds tokenId
+        uint256 strike_price;
+        uint256 bought_collateral_amount;
+        uint256 timestamp;
+        bool is_active;
+        uint64 option_index;
+    }
+
+    PositionObj[] internal positions;
+    OptionObj[] internal options;
+
+    mapping(address => PositionObj[]) positions_per_user;
+    mapping(uint64 => PositionObj) indexed_positions;
+    mapping(uint64 => OptionObj) indexed_options;
+
+    function viewPositionsForUser() view public returns (PositionObj[] memory){
+        return positions_per_user[msg.sender];
+    }
+
+    function expireOption(uint64 option_id) public {
+        OptionObj storage current_option = indexed_options[option_id];
+        PositionObj storage current_position = indexed_positions[current_option.position_id_fk];
+
+        require(block.timestamp - current_option.timestamp >= current_position.offered_contract_length, "Option didn't expire yet");
+
+        // Checks-effects-interactions to prevent reentrancy
+        current_option.is_active = false;
+        uint256 collateralToReturn = current_option.bought_collateral_amount;
+        current_position.collateral_balance += collateralToReturn;
+
+        emit OptionExpired(option_id, current_option.position_id_fk, collateralToReturn);
+    }
+
+    function createPosition(
+        address collateral_token_address,
+        address accepted_token_address,
+        uint256 collateral_balance,
+        uint16 premium_percentage_one_ten_thousandth,
+        uint16 offered_contract_length
+    ) external returns (uint64) {
+        require(collateral_balance > 0, "Collateral balance must be greater than 0");
+        require(premium_percentage_one_ten_thousandth > 0, "Premium must be greater than 0");
+        require(offered_contract_length > 0, "Contract length must be greater than 0");
+
+        PositionObj memory newPosition = PositionObj({
+            provider: msg.sender,
+            collateral_token_address: collateral_token_address,
+            accepted_token_address: accepted_token_address,
+            collateral_balance: collateral_balance,
+            premium_percentage_one_ten_thousandth: premium_percentage_one_ten_thousandth,
+            offered_contract_length: offered_contract_length,
+            position_index: starting_id_index_position
+        });
+
+        positions.push(newPosition);
+        uint64 positionId = starting_id_index_position;
+        indexed_positions[positionId] = newPosition;
+        positions_per_user[msg.sender].push(newPosition);
+
+        starting_id_index_position += 1;
+
+        emit PositionCreated(positionId, msg.sender, collateral_balance);
+
+        return positionId;
+    }
+
+    function estimatePremium(
+        uint256 amount, 
+        address collateral_token_address,
+        address accepted_token_address
+    ) public view returns (uint256[2] memory) {
+
+        uint256 remaining_amount = amount;
+        uint256 estimated_premium = 0;
+
+        for (uint64 i = 0; i < positions.length && remaining_amount > 0; i++) {
+            PositionObj storage position = positions[i];
+
+            if (
+                position.collateral_token_address == collateral_token_address &&
+                position.accepted_token_address == accepted_token_address &&
+                position.collateral_balance > 0
+            ) {
+                uint256 collateral_to_use = remaining_amount > position.collateral_balance
+                    ? position.collateral_balance
+                    : remaining_amount;
+
+                uint256 premium = (collateral_to_use * position.premium_percentage_one_ten_thousandth) / 10000;
+                estimated_premium += premium;
+
+                remaining_amount -= collateral_to_use;
+            }
+        }
+
+        require(remaining_amount == 0, "Insufficient liquidity to fully cover requested amount");
+
+        uint256 estimated_platform_fee = (amount * 25) / 10000;
+
+        return [estimated_premium, estimated_platform_fee];
+    }
+
+    function buyOption(
+        uint256 collateralAmount,
+        address collateral_token_address,
+        address accepted_token_address,
+        uint256 slippageTolerance,
+        uint256[2] memory estimate
+    ) external {
+        uint256 estimated_premium = estimate[0];
+        uint256 platform_fee = estimate[1];
+        uint256 maxPremium = estimated_premium + (estimated_premium * slippageTolerance / 10000);
+
+        uint256 totalPremium = 0;
+        uint256 remaining_amount = collateralAmount;
+
+        for (uint64 i = 0; i < positions.length && remaining_amount > 0; i++) {
+            PositionObj storage position = positions[i];
+
+            if (
+                position.collateral_token_address == collateral_token_address &&
+                position.accepted_token_address == accepted_token_address &&
+                position.collateral_balance > 0
+            ) {
+                uint256 collateral_to_use = remaining_amount > position.collateral_balance
+                    ? position.collateral_balance
+                    : remaining_amount;
+
+                uint256 premium = (collateral_to_use * position.premium_percentage_one_ten_thousandth) / 10000;
+                totalPremium += premium;
+
+                require(totalPremium <= maxPremium, "Slippage tolerance exceeded");
+
+                position.collateral_balance -= collateral_to_use;
+                remaining_amount -= collateral_to_use;
+
+                uint64 optionId = uint64(options.length);
+                mintNFT(msg.sender, optionId);
+                options.push(OptionObj({
+                    position_id_fk: i,
+                    nft_key: optionId,
+                    strike_price: 0,
+                    bought_collateral_amount: collateral_to_use,
+                    timestamp: block.timestamp,
+                    is_active: true,
+                    option_index: optionId
+                }));
+
+                IERC20(position.accepted_token_address).safeTransferFrom(msg.sender, position.provider, premium);
+
+                emit OptionBought(optionId, i, collateral_to_use, premium);
+            }
+        }
+
+        require(remaining_amount == 0, "Insufficient liquidity to fully cover requested amount");
+
+        IERC20(accepted_token_address).safeTransferFrom(msg.sender, feeRecipient, platform_fee);
+        totalPlatformFeesCollected += platform_fee;
+    }
+
+    function exerciseOption(uint64 nftId) external {
+        require(ownerOf(nftId) == msg.sender, "Caller is not the option holder");
+
+        OptionObj storage option = indexed_options[uint64(nftId)];
+        PositionObj storage position = indexed_positions[option.position_id_fk];
+
+        require(option.is_active, "Option is inactive or already exercised");
+        require(block.timestamp <= option.timestamp + position.offered_contract_length, "Option has expired");
+
+        uint256 totalPayment = option.bought_collateral_amount * option.strike_price;
+
+        IERC20(position.accepted_token_address).safeTransferFrom(msg.sender, position.provider, totalPayment);
+        IERC20(position.collateral_token_address).safeTransfer(msg.sender, option.bought_collateral_amount);
+
+        option.is_active = false;
+
+        emit OptionExpired(uint64(nftId), option.position_id_fk, option.bought_collateral_amount);
+
+        _burn(nftId);
+    }
+}
+
+// TO DO: Add strike price currently represented by 0 it should be set as whatever the current price is we can use price oracles for that
+// TO DO: Account for decimals for more user friendly experience we can do this on frontend on the dApp
+// TO DO: Provider should be able to withdraw from their position
